@@ -10,7 +10,6 @@ from typing import List, Dict
 
 try:
     import requests
-    from bs4 import BeautifulSoup
 except ImportError as e:
     print(f"Error: Missing dependencies. Please install them with: pip install -r requirements.txt")
     sys.exit(1)
@@ -19,8 +18,9 @@ except ImportError as e:
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Vulnerability Database URL (Example: using a mock database for demonstration)
-VULN_DB_URL = "https://raw.githubusercontent.com/example/vscan-dependency-checker/main/vuln_db.json"  # Replace with a real vulnerability database
+# The vulnerability database source is named by the operator with
+# --db-file or --db-url. There is no built in database and no default
+# fetch: a run with neither option names no source and exits 1.
 
 
 def setup_argparse() -> argparse.ArgumentParser:
@@ -32,6 +32,8 @@ def setup_argparse() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(description="Scans project dependency files for known vulnerabilities.")
     parser.add_argument("file_path", help="Path to the dependency file (e.g., requirements.txt, package.json).")
+    parser.add_argument("--db-file", help="Path to a local vulnerability database JSON file.")
+    parser.add_argument("--db-url", help="URL of a vulnerability database JSON file to fetch (explicit timeout of 10 seconds).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (debug logging).")
     return parser
 
@@ -48,7 +50,7 @@ def load_vulnerability_database(url: str) -> Dict:
              Returns an empty dictionary if there's an error loading the database.
     """
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         return response.json()
     except requests.exceptions.RequestException as e:
@@ -56,6 +58,16 @@ def load_vulnerability_database(url: str) -> Dict:
         return {}
     except json.JSONDecodeError as e:
         logging.error(f"Error decoding JSON from vulnerability database: {e}")
+        return {}
+
+
+def load_vulnerability_database_file(path: str) -> Dict:
+    """Loads the vulnerability database from a local JSON file named by the operator."""
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logging.error(f"Error loading vulnerability database file: {e}")
         return {}
 
 
@@ -78,10 +90,21 @@ def parse_requirements_txt(file_path: str) -> List[Dict[str, str]]:
                 if not line or line.startswith('#'):  # Skip empty lines and comments
                     continue
 
-                match = re.match(r"([a-zA-Z0-9_-]+)([=><]=?)([\d\.]+)", line)  # Flexible version matching
+                # Strip an inline comment or environment marker; neither is part of the requirement.
+                core = line.split('#', 1)[0].split(';', 1)[0].strip()
+                match = re.match(r"([A-Za-z0-9_.\-]+)(\[[^\]]+\])?\s*(.*)$", core)
                 if match:
-                    name, operator, version = match.groups()  # Capture the groups
-                    dependencies.append({"name": name, "version": version})
+                    name, extras, specifier = match.groups()
+                    specifier = (specifier or "").strip()
+                    first = specifier.split(',', 1)[0].strip()
+                    op_match = re.match(r"(===|==|~=|!=|>=|<=|>|<)?\s*([^\s,]+)?", first)
+                    operator = (op_match.group(1) or "") if op_match else ""
+                    version = (op_match.group(2) or "") if op_match else ""
+                    if version.endswith('.*'):
+                        version = version[:-2]
+                    dependencies.append({"name": name, "version": version,
+                                         "operator": operator, "specifier": specifier,
+                                         "extras": extras or ""})
                 else:
                    logging.warning(f"Could not parse dependency line: {line}")
 
@@ -113,10 +136,13 @@ def parse_package_json(file_path: str) -> List[Dict[str, str]]:
             all_dependencies = {**(data.get('dependencies', {})), **(data.get('devDependencies', {}))}  # Merge dependencies and devDependencies
 
             for name, version in all_dependencies.items():
+                raw = str(version).strip()
+                operator = "~=" if raw.startswith('~') else ("==" if raw.startswith('^') else "")
                 # Clean up version strings (e.g., remove ^, ~, =, >, <)
-                version = version.lstrip('^~=><')
+                version = raw.lstrip('^~=>< ')
 
-                dependencies.append({"name": name, "version": version})
+                dependencies.append({"name": name, "version": version,
+                                     "operator": operator, "specifier": raw, "extras": ""})
     except FileNotFoundError:
         logging.error(f"Dependency file not found: {file_path}")
         return []
@@ -146,13 +172,18 @@ def check_vulnerabilities(dependencies: List[Dict[str, str]], vulnerability_db: 
     vulnerable_dependencies = []
     for dependency in dependencies:
         name = dependency['name']
-        version = dependency['version']
+        version = dependency.get('version', '')
+        operator = dependency.get('operator', '==')
+
+        if not version:
+            # An unpinned entry is present, but there is no version to compare.
+            logging.info(f"Dependency '{name}' has no pinned version; no version comparison performed.")
+            continue
 
         if name in vulnerability_db:
             vulnerabilities = vulnerability_db[name]
             for vuln in vulnerabilities:
-               #Simplified check:  assume a vulnerability is present if dependency version matches reported vulnerable version
-               if version == vuln['version']:
+               if version_matches(operator, version, vuln['version']):
                    vulnerable_dependencies.append({
                        "name": name,
                        "version": version,
@@ -162,6 +193,69 @@ def check_vulnerabilities(dependencies: List[Dict[str, str]], vulnerability_db: 
             logging.debug(f"Dependency '{name}' not found in vulnerability database.")
 
     return vulnerable_dependencies
+
+
+def _version_key(text):
+    """Sortable key for a version string: numeric parts first, prerelease sorts before release."""
+    main_part, _, _suffix = str(text).partition('-')
+    nums = []
+    for piece in re.split(r"[.+_]", main_part):
+        m = re.match(r"(\d+)(.*)$", piece)
+        if m:
+            nums.append(int(m.group(1)))
+            if m.group(2):
+                nums.append(m.group(2))
+        else:
+            nums.append(piece)
+    return nums
+
+
+def _compare_versions(a, b):
+    ka, kb = _version_key(a), _version_key(b)
+    for x, y in zip(ka, kb):
+        if x == y:
+            continue
+        if isinstance(x, int) and isinstance(y, int):
+            return -1 if x < y else 1
+        return -1 if str(x) < str(y) else 1
+    if len(ka) == len(kb):
+        return 0
+    return -1 if len(ka) < len(kb) else 1
+
+
+def version_matches(operator, version, candidate):
+    """True when the database candidate version falls in the dependency specifier range.
+
+    Exact specifiers compare for equality. A tilde specifier accepts the
+    candidate when it is at or above the stated version and below the
+    next incompatible release (the last stated component may increase).
+    Range specifiers compare directly. This compares versions only; it
+    does not decide that any version is outdated.
+    """
+    if operator in ("", "==", "==="):
+        return version == candidate
+    cmp_result = _compare_versions(candidate, version)
+    if operator == "~=":
+        if cmp_result < 0:
+            return False
+        parts = [p for p in re.split(r"[.]", version) if p.isdigit()]
+        if len(parts) >= 2:
+            upper = parts[:-1]
+            upper[-1] = str(int(upper[-1]) + 1)
+            upper_text = ".".join(upper)
+            return _compare_versions(candidate, upper_text) < 0
+        return cmp_result == 0
+    if operator == ">=":
+        return cmp_result >= 0
+    if operator == "<=":
+        return cmp_result <= 0
+    if operator == ">":
+        return cmp_result > 0
+    if operator == "<":
+        return cmp_result < 0
+    if operator == "!=":
+        return version != candidate
+    return version == candidate
 
 
 def main():
@@ -180,7 +274,16 @@ def main():
         logging.error(f"File not found: {file_path}")
         sys.exit(1)
 
-    vulnerability_db = load_vulnerability_database(VULN_DB_URL)
+    if args.db_file and args.db_url:
+        logging.error("Name only one database source: --db-file or --db-url, not both.")
+        sys.exit(1)
+    if args.db_file:
+        vulnerability_db = load_vulnerability_database_file(args.db_file)
+    elif args.db_url:
+        vulnerability_db = load_vulnerability_database(args.db_url)
+    else:
+        logging.error("No vulnerability database source named. Pass --db-file <path> or --db-url <url>; nothing was checked.")
+        sys.exit(1)
     if not vulnerability_db:
         logging.error("Failed to load vulnerability database. Exiting.")
         sys.exit(1)
@@ -194,6 +297,10 @@ def main():
         logging.error("Unsupported file type.  Must be requirements.txt or package.json.")
         sys.exit(1)
 
+
+    if not dependencies:
+        logging.error("No dependencies were parsed from the input file; nothing was checked.")
+        sys.exit(1)
 
     vulnerable_dependencies = check_vulnerabilities(dependencies, vulnerability_db)
 
