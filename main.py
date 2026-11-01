@@ -96,6 +96,10 @@ def parse_requirements_txt(file_path: str) -> List[Dict[str, str]]:
                 if match:
                     name, extras, specifier = match.groups()
                     specifier = (specifier or "").strip()
+                    # Only the first constraint of a specifier drives
+                    # the match. In a line like pkg>=1.0,<2.0 the upper
+                    # bound is kept in the stored specifier text but
+                    # never used by version_matches.
                     first = specifier.split(',', 1)[0].strip()
                     op_match = re.match(r"(===|==|~=|!=|>=|<=|>|<)?\s*([^\s,]+)?", first)
                     operator = (op_match.group(1) or "") if op_match else ""
@@ -137,6 +141,11 @@ def parse_package_json(file_path: str) -> List[Dict[str, str]]:
 
             for name, version in all_dependencies.items():
                 raw = str(version).strip()
+                # A caret range is recorded as an exact pin, so the
+                # comparison below only flags the one stripped version.
+                # The range the manifest actually allows is never
+                # evaluated, and a vulnerable version inside that range
+                # at any other number is passed over.
                 operator = "~=" if raw.startswith('~') else ("==" if raw.startswith('^') else "")
                 # Clean up version strings (e.g., remove ^, ~, =, >, <)
                 version = raw.lstrip('^~=>< ')
@@ -180,6 +189,10 @@ def check_vulnerabilities(dependencies: List[Dict[str, str]], vulnerability_db: 
             logging.info(f"Dependency '{name}' has no pinned version; no version comparison performed.")
             continue
 
+        # Name matching is exact, case and separator included. Python
+        # treats django, Django, and django_core style spellings as the
+        # same project after normalisation, but a database key written
+        # any other way than the file's own spelling is missed here.
         if name in vulnerability_db:
             vulnerabilities = vulnerability_db[name]
             for vuln in vulnerabilities:
